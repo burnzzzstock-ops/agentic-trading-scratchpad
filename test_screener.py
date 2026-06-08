@@ -113,6 +113,36 @@ def test_missing_momentum_data_does_not_skip():
     assert r.tier == AUTO
 
 
+def test_unaffordable_whole_share_is_skip():
+    # CBRS-like: clean spread, big gap, but 1 share ($243) blows the $100 cap.
+    r = one(bid=242.70, ask=243.00, last=243.00, prev_close=201.0)
+    assert r.tier == SKIP
+    assert any("over $100/trade cap" in x for x in r.reasons)
+
+
+def test_fractional_rescues_when_allowed():
+    # Same name, but opt into fractional and confirm it's openable-fractional.
+    c = Candidate.parse(dict(CLEAN, bid=242.70, ask=243.00, last=243.00,
+                             prev_close=201.0, fractional=True))
+    r = screen_one(c, Filters(whole_share_only=False))
+    assert r.tier != SKIP
+    assert not any("over $100/trade cap" in x for x in r.reasons)
+
+
+def test_fractional_flag_alone_does_not_rescue_default():
+    # Default is whole-share: a fractional-eligible $243 name still skips.
+    r = one(bid=242.70, ask=243.00, last=243.00, prev_close=201.0, fractional=True)
+    assert r.tier == SKIP
+
+
+def test_one_share_under_cap_is_not_skipped_for_affordability():
+    # $75 name (with known float): only 1 whole share fits, but that's a valid
+    # position -> affordability must not skip it.
+    r = one(bid=74.75, ask=74.99, last=75.00, prev_close=88.6)
+    assert r.tier == AUTO
+    assert not any("/trade cap" in x for x in r.reasons)
+
+
 def test_accl_real_case_is_manual_watch():
     # Today's ACCL: tradable, $1.68, ~1.2% spread, unknown float.
     # Worth an alert, but only ever MANUAL (sub-$2 + unknown float).

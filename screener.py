@@ -44,6 +44,7 @@ from validator import (
     APPROVED_SETUPS,
     FLOAT_FULLAUTO_MIN,
     FLOAT_QUARANTINE,
+    HARD_PER_TRADE_NOTIONAL,
     PRICE_MIN,
     PRICE_MANUAL_BELOW,
     SPREAD_AUTO_MAX,
@@ -90,6 +91,11 @@ class Candidate:
 class Filters:
     min_gap_pct: float = DEFAULT_MIN_GAP_PCT
     min_vol_x: float = DEFAULT_MIN_VOL_X
+    # The validator sizes whole shares by default; on a $100/trade cap a name
+    # whose ask exceeds the cap can't take even a 1-share position and will
+    # BLOCK at fire time, so it's not worth an alert slot. Set False only if
+    # you intend to trade confirmed-eligible fractional shares.
+    whole_share_only: bool = True
 
 
 @dataclass
@@ -147,6 +153,11 @@ def screen_one(c: Candidate, filt: Filters) -> ScreenResult:
         reasons.append(f"spread {spread_pct*100:.2f}% over 2.00% hard veto")
     if not price or price < PRICE_MIN:
         reasons.append(f"price ${price:.2f} under ${PRICE_MIN:.2f} floor")
+    elif price > HARD_PER_TRADE_NOTIONAL and (filt.whole_share_only or not c.fractional):
+        # Can't afford even one whole share under the per-trade cap.
+        reasons.append(
+            f"1 whole share ${price:.2f} over ${HARD_PER_TRADE_NOTIONAL:.0f}/trade cap"
+        )
 
     # Momentum prefilter (only when the data is present — pre-open it may not be)
     if c.gap_pct is not None and abs(c.gap_pct) < filt.min_gap_pct:
@@ -214,6 +225,8 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true", help="emit JSON not text")
     ap.add_argument("--min-gap", type=float, default=None, help="min |gap_pct| to keep")
     ap.add_argument("--min-vol", type=float, default=None, help="min rel-vol (x) to keep")
+    ap.add_argument("--allow-fractional", action="store_true",
+                    help="keep names over the $100/share cap if fractional-eligible")
     ap.add_argument("--top", type=int, default=None, help="only show the top N")
     args = ap.parse_args(argv)
 
@@ -228,6 +241,8 @@ def main(argv=None) -> int:
         else fblock.get("min_gap_pct", DEFAULT_MIN_GAP_PCT),
         min_vol_x=args.min_vol if args.min_vol is not None
         else fblock.get("min_vol_x", DEFAULT_MIN_VOL_X),
+        whole_share_only=False if args.allow_fractional
+        else fblock.get("whole_share_only", True),
     )
 
     results = screen(candidates, filt)
