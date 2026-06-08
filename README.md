@@ -32,7 +32,13 @@ live entry + slippage, and blocks anything missing a verified catalyst.
 - `validator.py` — pure-logic gate. No network I/O; the agent feeds it live
   data. Run `echo '{"payload":{…},"context":{…}}' | python3 validator.py`.
   Exit codes: `0` FULL_AUTO, `10` MANUAL_CONFIRM, `20` BLOCK.
-- `test_validator.py` — 27 tests. Run `python3 test_validator.py`.
+- `news_filter.py` — free, no-key catalyst filter. Checks SEC 8-K filings
+  (verified → may grade A) then Google News RSS (evidence only → capped at A-,
+  i.e. routes to manual). Flags dilution/offering/distress language, which the
+  validator vetoes. `python3 news_filter.py <TICKER> --company "<name>"`.
+  Keyword sentiment is a screen, not proof — it has false positives, which is
+  why news-only never auto-fires. Needs `news.google.com` + `sec.gov` allowed.
+- `test_validator.py` / `test_news_filter.py` — 27 + 12 tests.
 - `ROUTINE_PROMPT.md` — the prompt + Zapier wiring for the cloud routine.
 
 ## Spec conflicts (resolved to the stricter reading)

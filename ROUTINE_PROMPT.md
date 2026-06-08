@@ -33,9 +33,16 @@ Using the Robingood tools, collect everything `validator.py` needs:
   `pending_deposits` as NOT settled; if cash is all pending, settled_cash = 0).
 - `get_equity_orders` (created_at_gte = today, this account) → count today's
   trades and realized day P&L.
-- **Catalyst**: verify a fresh (≤24h), real catalyst from a news source. If
-  you have no news tool available, you CANNOT verify one — set catalyst to
-  null, which forces a BLOCK. Grade tier A / A- / B / ambiguous.
+- **Catalyst + dilution**: run the free filter —
+  `python3 news_filter.py <TICKER> --company "<name>"`. It checks SEC 8-K
+  filings (verified, can grade A) then Google News RSS (capped at A- → manual),
+  and returns a `catalyst` block plus a `dilution_overhang` flag. Merge BOTH
+  into the validator context. If the filter errors out (no news/SEC reachable),
+  its catalyst is unverified → the validator BLOCKs, which is the safe default.
+  Requires the environment to allowlist `news.google.com` and `sec.gov`.
+  Treat news-derived matches skeptically — the keyword scorer has false
+  positives (e.g. "upgrade" in an unrelated headline); the A- cap routes these
+  to manual review on purpose.
 - **Float** and **nearest overhead resistance**: supply if you can source
   them; leave null otherwise (null float → manual; no resistance → uses
   target, which is weaker — prefer a real level).
