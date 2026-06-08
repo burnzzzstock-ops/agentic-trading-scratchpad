@@ -36,9 +36,15 @@ screen exactly that.
 - `get_equity_tradability` (batches of 10, agentic account) → `tradable`
   this session and fractional eligibility. Drop names `tradeable=false` or
   `state!=active` before screening (or pass them through as `tradable:false`).
-- **Float** and **rel-volume (`vol_x`)**: supply if you can source them; leave
-  `float_shares` null and omit `vol_x` otherwise. Null float → the screen
-  routes the name to MANUAL_WATCH, never AUTO.
+- **Float**: run `python3 float_source.py <TICKER> --price <live ask>` per
+  candidate. It derives float-in-shares from SEC `dei:EntityPublicFloat` ÷ price
+  (a real non-affiliate float estimate), falls back to shares-outstanding only
+  as a sub-10M upper bound, and returns `float_shares: null` for foreign/OTC or
+  recent-IPO names — which keeps them MANUAL, never AUTO. Merge `float_shares`
+  into each candidate. Uses only `sec.gov`/`data.sec.gov` (already allowlisted
+  for the catalyst filter — no new network permission).
+- **rel-volume (`vol_x`)**: supply if you can source it; omit otherwise (absent
+  momentum data never causes a SKIP). Null float → screen routes to MANUAL.
 - Do **not** run the catalyst filter here — catalysts are intraday and checked
   per-fire. (Optional: you may run `news_filter.py` to *deprioritize* names
   carrying a dilution/offering flag, but don't gate alerts on it.)
