@@ -38,8 +38,16 @@ live entry + slippage, and blocks anything missing a verified catalyst.
   validator vetoes. `python3 news_filter.py <TICKER> --company "<name>"`.
   Keyword sentiment is a screen, not proof — it has false positives, which is
   why news-only never auto-fires. Needs `news.google.com` + `sec.gov` allowed.
-- `test_validator.py` / `test_news_filter.py` — 27 + 12 tests.
-- `ROUTINE_PROMPT.md` — the prompt + Zapier wiring for the cloud routine.
+- `screener.py` — pure-logic **pre-market screener**. Imports its thresholds
+  from `validator.py` so the morning watchlist can't drift from the fire-time
+  gate. Buckets a live candidate universe into AUTO_WATCH / MANUAL_WATCH / SKIP
+  on the dimensions knowable pre-open (price, spread, tradability, float,
+  optional gap/vol floors). Catalyst + R:R stay per-fire.
+  `echo '{"candidates":[…]}' | python3 screener.py --json`.
+- `test_validator.py` / `test_news_filter.py` / `test_screener.py` — 27 + 12 + 15 tests.
+- `ROUTINE_PROMPT.md` — the fire-time prompt + Zapier wiring for the cloud routine.
+- `MORNING_SCREEN_PROMPT.md` — the once-a-morning prompt that builds the live
+  candidate universe, runs `screener.py`, and syncs the watchlist.
 
 ## Spec conflicts (resolved to the stricter reading)
 
