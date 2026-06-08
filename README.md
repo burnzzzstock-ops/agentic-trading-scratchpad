@@ -38,6 +38,12 @@ live entry + slippage, and blocks anything missing a verified catalyst.
   validator vetoes. `python3 news_filter.py <TICKER> --company "<name>"`.
   Keyword sentiment is a screen, not proof — it has false positives, which is
   why news-only never auto-fires. Needs `news.google.com` + `sec.gov` allowed.
+- `float_source.py` — free, no-key float lookup. Yahoo `floatShares` (true
+  public float) primary, SEC `EntityCommonStockSharesOutstanding` (shares-out
+  upper bound, tagged `is_true_float:false`) fallback. `python3 float_source.py
+  <TICKER>`, or `python3 validator.py --fetch-float` to fill a null float at the
+  CLI boundary (a SEC-proxy ≥10M is forced to MANUAL, never auto-fired). Needs
+  `query1/query2.finance.yahoo.com`, `fc.yahoo.com`, `sec.gov` allowed.
 - `test_validator.py` / `test_news_filter.py` — 27 + 12 tests.
 - `ROUTINE_PROMPT.md` — the prompt + Zapier wiring for the cloud routine.
 

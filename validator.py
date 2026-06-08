@@ -400,13 +400,41 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Validator & Risk gate")
     ap.add_argument("--input", help="JSON file with payload+context; default stdin")
     ap.add_argument("--json", action="store_true", help="emit JSON not text")
+    ap.add_argument(
+        "--fetch-float", action="store_true",
+        help="if context float_shares is null, source it live (Yahoo->SEC). "
+             "This is the only networked step; evaluate() stays pure.",
+    )
     args = ap.parse_args(argv)
 
     raw = open(args.input).read() if args.input else sys.stdin.read()
     obj = json.loads(raw)
     payload = Payload.parse(obj["payload"])
     ctx = MarketContext.parse(obj["context"])
+
+    # Optional live enrichment at the agent/CLI boundary (NOT inside evaluate).
+    # The SEC fallback returns shares-outstanding (an upper bound on float), so
+    # when that proxy clears the 10M gate we still can't confirm the *true*
+    # float is >= 10M and must force a human to confirm it.
+    float_is_proxy = False
+    if args.fetch_float and ctx.float_shares is None:
+        from float_source import build_float
+        fr = build_float(payload.ticker)
+        ctx.float_shares = fr.float_shares
+        float_is_proxy = (
+            fr.float_shares is not None
+            and not fr.is_true_float
+            and fr.float_shares >= FLOAT_FULLAUTO_MIN
+        )
+
     decision = evaluate(payload, ctx)
+
+    if float_is_proxy:
+        decision.manual.append(
+            "float is SEC shares-outstanding proxy (true float unverified)"
+        )
+        if decision.action == "FULL_AUTO":
+            decision.action = "MANUAL_CONFIRM"
 
     if args.json:
         print(json.dumps(decision.to_dict(), indent=2))

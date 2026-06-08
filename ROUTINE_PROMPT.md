@@ -43,9 +43,18 @@ Using the Robingood tools, collect everything `validator.py` needs:
   Treat news-derived matches skeptically — the keyword scorer has false
   positives (e.g. "upgrade" in an unrelated headline); the A- cap routes these
   to manual review on purpose.
-- **Float** and **nearest overhead resistance**: supply if you can source
-  them; leave null otherwise (null float → manual; no resistance → uses
-  target, which is weaker — prefer a real level).
+- **Float**: source it with the free filter —
+  `python3 float_source.py <TICKER>`. It tries Yahoo's `floatShares` (true
+  public float) first, then falls back to SEC `EntityCommonStockSharesOutstanding`
+  (shares outstanding — an upper bound on float, tagged `is_true_float:false`).
+  Put the returned `float_shares` into the context. Equivalently, pass
+  `--fetch-float` to `validator.py` and it will fill a null float for you at
+  the CLI boundary (and force MANUAL if only the SEC proxy was available, since
+  a proxy ≥10M cannot confirm the *true* float ≥10M). If nothing is reachable,
+  float stays null → manual, the safe default. Requires the environment to
+  allowlist `query1/query2.finance.yahoo.com`, `fc.yahoo.com`, and `sec.gov`.
+- **Nearest overhead resistance**: supply if you can source it; leave null
+  otherwise (no resistance → uses target, which is weaker — prefer a real level).
 
 ## 3. Run the deterministic gate
 Build a JSON object `{"payload": {...}, "context": {...}}` matching the
