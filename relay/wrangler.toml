@@ -1,0 +1,8 @@
+name = "tv-relay"
+main = "src/worker.js"
+compatibility_date = "2026-06-09"
+
+# Variables (FIRE_URL, HOOK_SECRET) and the ROUTINE_TOKEN secret are set in
+# the Cloudflare dashboard, NOT here — never commit the token to the repo.
+# keep_vars stops CI deploys from wiping the dashboard-configured values.
+keep_vars = true
