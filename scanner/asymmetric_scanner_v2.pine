@@ -1,0 +1,237 @@
+//@version=5
+// =============================================================================
+// Asymmetric Scanner v2 — "Singles" edition (ORB / VWAP / PMH alerts)
+// Run on a 5-MINUTE chart, extended hours ON, one symbol per chart.
+// Alert setup: Condition = this indicator -> "Any alert() function call".
+//
+// Philosophy: singles, not homeruns. Small risk units (0.15-0.60 daily ATR),
+// modest absolute targets that are still >=2.8x the risk unit, taken only in
+// the morning trend window on liquid names that haven't already run.
+//
+// v2 changes vs v1 (each exists to stop wasting the 2-trades/day budget):
+//   1. Extension cap: close must be within maxExtATR of the trigger level.
+//      (The validator re-prices at the live ask; pre-extended alerts die
+//      there with exec R:R < 2.25 — see the AMAT 2026-06-09 journal entry.)
+//   2. Risk-unit band: stop distance must be 0.15-0.60 ATR. Wider = homerun
+//      hunting; tighter = slippage dominates and the validator blocks.
+//   3. Signal window 09:35-11:30 ET only. No lunch chop, no afternoon traps.
+//   4. One alert per setup per day. Re-breaks after a failure are worse.
+//   5. Max-gap veto: gaps > 3 ATR are exhaustion, not continuation.
+//   6. Volume baseline uses RTH bars only (PM bars made volOk trivially true).
+//   7. Min average daily dollar volume (spread proxy Pine can actually see).
+//   8. ORB stop defaults to OR midpoint (selectable: OR low / OR mid / bar low).
+//   9. Breakouts must clear RTH VWAP (buyer control).
+//  10. targetRR default 2.8 so slippage-adjusted R:R clears the 2.25 floor.
+//  11. alertcondition fallbacks removed — alert() JSON is the only output.
+//
+// NOTE: Pine cannot see bid/ask. The spread veto lives in the validator.
+// =============================================================================
+indicator("Asymmetric Scanner v2 — Singles", overlay=true, max_labels_count=500)
+
+// ---------------- INPUTS ----------------
+gU = "Universe"
+minPrice     = input.float(2.0,    "Min price",                          group=gU)
+maxPrice     = input.float(5000.0, "Max price",                          group=gU)
+minGapATR    = input.float(0.4,    "Min gap in daily ATRs",              group=gU)
+maxGapATR    = input.float(3.0,    "Max gap in daily ATRs (exhaustion)", group=gU)
+minDollarVol = input.float(10.0,   "Min avg daily $ volume (millions)",  group=gU)
+
+gV = "Volume / momentum"
+volLen      = input.int(20,    "Volume avg length (RTH bars)",      group=gV)
+volMult     = input.float(1.5, "Breakout vol must exceed avg x",    group=gV)
+requireVWAP = input.bool(true, "Breakouts must be above RTH VWAP",  group=gV)
+
+gS = "Setups"
+useORB   = input.bool(true, "Opening Range Breakout",            group=gS)
+useVWAP  = input.bool(true, "VWAP first-pullback reclaim",       group=gS)
+usePMH   = input.bool(true, "Reclaimed premarket-high breakout", group=gS)
+oneShot  = input.bool(true, "One alert per setup per day",       group=gS)
+orbStopMode = input.string("OR mid", "ORB stop basis", options=["OR low", "OR mid", "Bar low"], group=gS)
+
+gR = "Risk / sizing (payload only)"
+equity      = input.float(250.0, "Account equity $",            group=gR)
+riskPct     = input.float(2.0,   "Risk % per trade",            group=gR)
+slipATRfrac = input.float(0.03,  "Slippage = this x daily ATR", group=gR)
+minSlipTicks= input.int(2,       "Min slippage floor (ticks)",  group=gR)
+targetRR    = input.float(2.8,   "Modeled target R multiple (validator needs exec >= 2.25 after slip)", group=gR)
+
+gG = "Regime"
+useRegime = input.bool(true, "Require benchmark green (above prior close)", group=gG)
+regimeSym = input.symbol("SPY", "Regime benchmark symbol",                  group=gG)
+
+gRv = "Vetoes (the 'singles' band)"
+orRangeATRmult = input.float(1.5,  "Veto if opening range > this x daily ATR",     group=gRv)
+maxExtATR      = input.float(0.20, "Max close extension above trigger (ATRs)",     group=gRv)
+minRiskATR     = input.float(0.15, "Min stop distance (ATRs) — slippage floor",    group=gRv)
+maxRiskATR     = input.float(0.60, "Max stop distance (ATRs) — homerun veto",      group=gRv)
+
+gT = "Sessions (ET)"
+pmSess  = input.session("0400-0930", "Premarket",            group=gT)
+orSess  = input.session("0930-0935", "Opening range",        group=gT)
+rthSess = input.session("0930-1600", "Regular hours",        group=gT)
+sigSess = input.session("0935-1130", "Signal window (no lunch/afternoon chop)", group=gT)
+tz = "America/New_York"
+
+// ---------------- SESSION / DAY STATE ----------------
+inPM   = not na(time(timeframe.period, pmSess,  tz))
+inOR   = not na(time(timeframe.period, orSess,  tz))
+inRTH  = not na(time(timeframe.period, rthSess, tz))
+inSig  = not na(time(timeframe.period, sigSess, tz))
+newDay = ta.change(time("D")) != 0
+newRTH = inRTH and not inRTH[1]   // first RTH bar of the day -> VWAP anchor
+
+var float pmHigh       = na
+var float orHigh       = na
+var float orLow        = na
+var bool  orDone       = false
+var int   failedBreaks = 0
+var bool  hadImpulse   = false
+var bool  firedORB     = false
+var bool  firedVWAP    = false
+var bool  firedPMH     = false
+
+if newDay
+    pmHigh       := na
+    orHigh       := na
+    orLow        := na
+    orDone       := false
+    failedBreaks := 0
+    hadImpulse   := false
+    firedORB     := false
+    firedVWAP    := false
+    firedPMH     := false
+
+// premarket high (frozen once RTH starts; only updates during PM)
+if inPM
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+
+// opening range (first 5-min window)
+if inOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+
+if inRTH and not inOR and not orDone and not na(orHigh)
+    orDone := true
+
+// ---------------- DATA ----------------
+prevClose = request.security(syminfo.tickerid, "D", close[1],          lookahead=barmerge.lookahead_off)
+dailyATR  = request.security(syminfo.tickerid, "D", ta.atr(14)[1],     lookahead=barmerge.lookahead_off)
+dAvgVol   = request.security(syminfo.tickerid, "D", ta.sma(volume, 20)[1], lookahead=barmerge.lookahead_off)
+
+gapPct = na(prevClose) ? na : (close - prevClose) / prevClose * 100.0
+gapATR = (na(prevClose) or na(dailyATR) or dailyATR == 0) ? na : (close - prevClose) / dailyATR
+
+// VWAP anchored to the RTH open (ignores premarket even with ext hours on)
+vwapVal = ta.vwap(hlc3, newRTH)
+
+// Volume baseline from RTH bars ONLY. v1 used ta.sma over all bars, so the
+// near-zero premarket bars dragged the average down and volOk passed for
+// almost any morning bar. Wilder-style running mean updated only in RTH.
+var float volAvgRTH = na
+if inRTH
+    volAvgRTH := na(volAvgRTH) ? volume : (volAvgRTH * (volLen - 1) + volume) / volLen
+volOk     = not na(volAvgRTH) and volume > volAvgRTH * volMult
+upperHalf = close >= low + (high - low) * 0.5
+
+// Benchmark regime proxy (benchmark above prior daily close = risk-on)
+benchPrev = request.security(regimeSym, "D",              close[1], lookahead=barmerge.lookahead_off)
+benchNow  = request.security(regimeSym, timeframe.period, close,    lookahead=barmerge.lookahead_off)
+regimeOk  = not useRegime or (not na(benchPrev) and not na(benchNow) and benchNow > benchPrev)
+
+// --- ATR RANGE VETO ---
+orRange   = orHigh - orLow
+rangeVeto = not na(orRange) and not na(dailyATR) and dailyATR > 0 and (orRange > dailyATR * orRangeATRmult)
+
+// failed-breakout counter (closes back under OR high after breaking it)
+if orDone and not na(orHigh) and close < orHigh and close[1] > orHigh
+    failedBreaks := failedBreaks + 1
+tooManyFails = failedBreaks > 1
+
+// impulse flag for VWAP setup (price extended >0.5% above VWAP earlier in RTH)
+if inRTH and not na(vwapVal) and close > vwapVal and (high - vwapVal) / vwapVal * 100.0 > 0.5
+    hadImpulse := true
+
+// ---------------- BASE GATE ----------------
+priceOk     = close >= minPrice and close <= maxPrice
+gapOk       = not na(gapATR) and gapATR >= minGapATR and gapATR <= maxGapATR
+dollarVolOk = not na(dAvgVol) and not na(prevClose) and dAvgVol * prevClose >= minDollarVol * 1e6
+vwapAlign   = not requireVWAP or (not na(vwapVal) and close > vwapVal)
+baseOk      = inRTH and inSig and orDone and priceOk and gapOk and dollarVolOk and regimeOk and vwapAlign and not rangeVeto
+
+// Singles band: trigger proximity + sane risk unit, both in daily ATRs.
+f_extOk(trigger) =>
+    not na(trigger) and not na(dailyATR) and dailyATR > 0 and (close - trigger) <= dailyATR * maxExtATR
+f_riskOk(stop) =>
+    not na(stop) and not na(dailyATR) and dailyATR > 0 and close > stop and
+       (close - stop) >= dailyATR * minRiskATR and (close - stop) <= dailyATR * maxRiskATR
+
+// ---------------- SETUPS ----------------
+// A. Opening Range Breakout
+orbStop = orbStopMode == "OR low" ? orLow : orbStopMode == "OR mid" ? (orHigh + orLow) / 2.0 : low
+orbTrig = useORB and baseOk and not tooManyFails and not (oneShot and firedORB) and
+       not na(orHigh) and close > orHigh and close[1] <= orHigh and upperHalf and volOk and
+       f_extOk(orHigh) and f_riskOk(orbStop)
+
+// B. VWAP first-pullback reclaim
+vwapStop = math.min(low, low[1])
+vwapTrig = useVWAP and baseOk and hadImpulse and not (oneShot and firedVWAP) and
+       not na(vwapVal) and close > vwapVal and close[1] <= vwapVal and upperHalf and volOk and
+       f_extOk(vwapVal) and f_riskOk(vwapStop)
+
+// C. Reclaimed premarket-high breakout (consolidation under PMH then break)
+belowPMH = not na(pmHigh) and ta.highest(close, 3)[1] <= pmHigh
+pmhStop  = ta.lowest(low, 5)
+pmhTrig  = usePMH and baseOk and not (oneShot and firedPMH) and
+       not na(pmHigh) and close > pmHigh and close[1] <= pmHigh and upperHalf and volOk and belowPMH and
+       f_extOk(pmHigh) and f_riskOk(pmhStop)
+
+// ---------------- PAYLOAD ----------------
+f_payload(setupName, entry, stop) =>
+    riskD    = equity * riskPct / 100.0
+    atrSlip  = na(dailyATR) ? entry * 0.001 : dailyATR * slipATRfrac
+    tickSlip = minSlipTicks * syminfo.mintick
+    slipBuf  = math.max(atrSlip, tickSlip)          // realistic adverse-fill buffer
+    perShare = (entry - stop) + slipBuf
+    sh       = perShare <= 0.0 ? 0.0 : (riskD / perShare)   // fractional shares allowed
+    tgt      = entry + (entry - stop) * targetRR
+    notional = sh * entry
+    volx     = na(volAvgRTH) or volAvgRTH == 0 ? 0.0 : volume / volAvgRTH
+    '{"ticker":"'     + syminfo.ticker + '","setup":"' + setupName +
+      '","price":'    + str.tostring(entry,    "#.####") +
+      ',"stop":'      + str.tostring(stop,     "#.####") +
+      ',"target":'    + str.tostring(tgt,      "#.####") +
+      ',"rr_modeled":'+ str.tostring(targetRR, "#.##")   +
+      ',"shares":'    + str.tostring(sh,       "#.##")   +
+      ',"notional":'  + str.tostring(notional, "#.##")   +
+      ',"atr":'       + str.tostring(dailyATR, "#.####") +
+      ',"gap_atr":'   + str.tostring(gapATR,   "#.##")   +
+      ',"gap_pct":'   + str.tostring(gapPct,   "#.#")    +
+      ',"slip_est":'  + str.tostring(slipBuf,  "#.####") +
+      ',"vol_x":'     + str.tostring(volx,     "#.##")   +
+      ',"spread_note":"AGENT_MUST_VERIFY"}'
+
+// ---------------- ALERTS ----------------
+if orbTrig and barstate.isconfirmed
+    firedORB := true
+    alert(f_payload("ORB",          close, orbStop),  alert.freq_once_per_bar_close)
+if vwapTrig and barstate.isconfirmed
+    firedVWAP := true
+    alert(f_payload("VWAP_RECLAIM", close, vwapStop), alert.freq_once_per_bar_close)
+if pmhTrig and barstate.isconfirmed
+    firedPMH := true
+    alert(f_payload("PMH_BREAK",    close, pmhStop),  alert.freq_once_per_bar_close)
+
+// (v1's alertcondition fallbacks removed on purpose: they emit plain text,
+//  not the JSON payload, and binding an alert to them broke the pipeline.)
+
+// ---------------- VISUALS ----------------
+plot(orDone ? orHigh : na, "OR High", color.new(color.aqua, 0),  1, plot.style_linebr)
+plot(orDone ? orLow  : na, "OR Low",  color.new(color.aqua, 50), 1, plot.style_linebr)
+plot(not na(pmHigh) ? pmHigh : na, "PM High", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(inRTH ? vwapVal : na, "VWAP (RTH)", color.new(color.fuchsia, 0), 2)
+
+plotshape(orbTrig,  "ORB",  shape.triangleup, location.belowbar, color.new(color.lime,   0), text="ORB",  size=size.tiny)
+plotshape(vwapTrig, "VWAP", shape.triangleup, location.belowbar, color.new(color.teal,   0), text="VWAP", size=size.tiny)
+plotshape(pmhTrig,  "PMH",  shape.triangleup, location.belowbar, color.new(color.orange, 0), text="PMH",  size=size.tiny)
+bgcolor(rangeVeto ? color.new(color.red, 92) : na, title="Range veto")
+bgcolor(inRTH and not inSig ? color.new(color.gray, 94) : na, title="Outside signal window")
