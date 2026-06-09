@@ -1,0 +1,230 @@
+//@version=5
+// =============================================================================
+// Asymmetric Scanner v2 — STRATEGY TWIN (backtesting only, fires no alerts)
+// Run on a 5-MINUTE chart, extended hours ON, one symbol per chart.
+//
+// Entry logic is IDENTICAL to scanner/asymmetric_scanner_v2.pine. On top it
+// simulates what the live pipeline would do with each signal:
+//   - fill at NEXT bar open (mirrors routine latency after the alert)
+//   - bracket: stop at setup stop, limit at entry + (entry-stop) * targetRR
+//   - flat by 15:50 ET (cash account, no overnights)
+//   - max 2 entries/day, one position at a time, $100 notional clamp
+//     (mirrors validator caps so the equity curve is what you'd really get)
+//
+// HOW TO USE (per-setup edge discovery):
+//   1. Add to chart -> Strategy Tester tab.
+//   2. Toggle ONE setup on at a time (Setups group) -> note win rate, profit
+//      factor, max drawdown, avg trade. Repeat for each setup.
+//   3. Repeat across 10-20 liquid symbols of the type you actually scan.
+//   4. Stress-test: raise "Slippage (ticks)" in Properties to 4-6 and see
+//      which setups survive. An edge that dies at 2 extra ticks isn't one.
+//   5. Keep the setups that hold profit factor > ~1.3 AFTER slippage stress;
+//      disable the rest in the live scanner.
+//
+// HONESTY NOTES:
+//   - Tester fills are simplified: if stop AND target are touched in the same
+//     5-min bar, TradingView guesses the order. Treat close calls skeptically.
+//   - Past edge != future edge. This finds what WAS profitable; the journal
+//     verifies it still is.
+// =============================================================================
+strategy("Asymmetric Scanner v2 — Strategy Twin", overlay=true,
+     initial_capital=250, currency=currency.USD,
+     commission_type=strategy.commission.percent, commission_value=0.0,
+     slippage=2, pyramiding=0, calc_on_every_tick=false,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     max_labels_count=500)
+
+// ---------------- INPUTS (identical to scanner v2) ----------------
+gU = "Universe"
+minPrice     = input.float(2.0,    "Min price",                          group=gU)
+maxPrice     = input.float(5000.0, "Max price",                          group=gU)
+minGapATR    = input.float(0.4,    "Min gap in daily ATRs",              group=gU)
+maxGapATR    = input.float(3.0,    "Max gap in daily ATRs (exhaustion)", group=gU)
+minDollarVol = input.float(10.0,   "Min avg daily $ volume (millions)",  group=gU)
+
+gV = "Volume / momentum"
+volLen      = input.int(20,    "Volume avg length (RTH bars)",      group=gV)
+volMult     = input.float(1.5, "Breakout vol must exceed avg x",    group=gV)
+requireVWAP = input.bool(true, "Breakouts must be above RTH VWAP",  group=gV)
+
+gS = "Setups (toggle ONE at a time for per-setup stats)"
+useORB   = input.bool(true, "Opening Range Breakout",            group=gS)
+useVWAP  = input.bool(true, "VWAP first-pullback reclaim",       group=gS)
+usePMH   = input.bool(true, "Reclaimed premarket-high breakout", group=gS)
+oneShot  = input.bool(true, "One entry per setup per day",       group=gS)
+orbStopMode = input.string("OR mid", "ORB stop basis", options=["OR low", "OR mid", "Bar low"], group=gS)
+
+gR = "Risk / sizing (mirrors validator)"
+equity      = input.float(250.0, "Account equity $",            group=gR)
+riskPct     = input.float(2.0,   "Risk % per trade",            group=gR)
+slipATRfrac = input.float(0.03,  "Slippage = this x daily ATR", group=gR)
+minSlipTicks= input.int(2,       "Min slippage floor (ticks)",  group=gR)
+targetRR    = input.float(2.8,   "Target R multiple",           group=gR)
+maxNotional = input.float(100.0, "Per-trade notional cap $ (validator clamp)", group=gR)
+maxPerDay   = input.int(2,       "Max entries per day (validator cap)",        group=gR)
+
+gG = "Regime"
+useRegime = input.bool(true, "Require benchmark green (above prior close)", group=gG)
+regimeSym = input.symbol("SPY", "Regime benchmark symbol",                  group=gG)
+
+gRv = "Vetoes (the 'singles' band)"
+orRangeATRmult = input.float(1.5,  "Veto if opening range > this x daily ATR",  group=gRv)
+maxExtATR      = input.float(0.20, "Max close extension above trigger (ATRs)",  group=gRv)
+minRiskATR     = input.float(0.15, "Min stop distance (ATRs) — slippage floor", group=gRv)
+maxRiskATR     = input.float(0.60, "Max stop distance (ATRs) — homerun veto",   group=gRv)
+
+gT = "Sessions (ET)"
+pmSess  = input.session("0400-0930", "Premarket",            group=gT)
+orSess  = input.session("0930-0935", "Opening range",        group=gT)
+rthSess = input.session("0930-1600", "Regular hours",        group=gT)
+sigSess = input.session("0935-1130", "Signal window",        group=gT)
+eodSess = input.session("1550-1600", "EOD flatten window",   group=gT)
+tz = "America/New_York"
+
+// ---------------- SESSION / DAY STATE ----------------
+inPM   = not na(time(timeframe.period, pmSess,  tz))
+inOR   = not na(time(timeframe.period, orSess,  tz))
+inRTH  = not na(time(timeframe.period, rthSess, tz))
+inSig  = not na(time(timeframe.period, sigSess, tz))
+inEOD  = not na(time(timeframe.period, eodSess, tz))
+newDay = ta.change(time("D")) != 0
+newRTH = inRTH and not inRTH[1]
+
+var float pmHigh       = na
+var float orHigh       = na
+var float orLow        = na
+var bool  orDone       = false
+var int   failedBreaks = 0
+var bool  hadImpulse   = false
+var bool  firedORB     = false
+var bool  firedVWAP    = false
+var bool  firedPMH     = false
+var int   tradesToday  = 0
+
+if newDay
+    pmHigh       := na
+    orHigh       := na
+    orLow        := na
+    orDone       := false
+    failedBreaks := 0
+    hadImpulse   := false
+    firedORB     := false
+    firedVWAP    := false
+    firedPMH     := false
+    tradesToday  := 0
+
+if inPM
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+
+if inOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+
+if inRTH and not inOR and not orDone and not na(orHigh)
+    orDone := true
+
+// ---------------- DATA ----------------
+prevClose = request.security(syminfo.tickerid, "D", close[1],          lookahead=barmerge.lookahead_off)
+dailyATR  = request.security(syminfo.tickerid, "D", ta.atr(14)[1],     lookahead=barmerge.lookahead_off)
+dAvgVol   = request.security(syminfo.tickerid, "D", ta.sma(volume, 20)[1], lookahead=barmerge.lookahead_off)
+
+gapATR = (na(prevClose) or na(dailyATR) or dailyATR == 0) ? na : (close - prevClose) / dailyATR
+
+vwapVal = ta.vwap(hlc3, newRTH)
+
+var float volAvgRTH = na
+if inRTH
+    volAvgRTH := na(volAvgRTH) ? volume : (volAvgRTH * (volLen - 1) + volume) / volLen
+volOk     = not na(volAvgRTH) and volume > volAvgRTH * volMult
+upperHalf = close >= low + (high - low) * 0.5
+
+benchPrev = request.security(regimeSym, "D",              close[1], lookahead=barmerge.lookahead_off)
+benchNow  = request.security(regimeSym, timeframe.period, close,    lookahead=barmerge.lookahead_off)
+regimeOk  = not useRegime or (not na(benchPrev) and not na(benchNow) and benchNow > benchPrev)
+
+orRange   = orHigh - orLow
+rangeVeto = not na(orRange) and not na(dailyATR) and dailyATR > 0 and (orRange > dailyATR * orRangeATRmult)
+
+if orDone and not na(orHigh) and close < orHigh and close[1] > orHigh
+    failedBreaks := failedBreaks + 1
+tooManyFails = failedBreaks > 1
+
+if inRTH and not na(vwapVal) and close > vwapVal and (high - vwapVal) / vwapVal * 100.0 > 0.5
+    hadImpulse := true
+
+// ---------------- BASE GATE ----------------
+priceOk     = close >= minPrice and close <= maxPrice
+gapOk       = not na(gapATR) and gapATR >= minGapATR and gapATR <= maxGapATR
+dollarVolOk = not na(dAvgVol) and not na(prevClose) and dAvgVol * prevClose >= minDollarVol * 1e6
+vwapAlign   = not requireVWAP or (not na(vwapVal) and close > vwapVal)
+baseOk      = inRTH and inSig and orDone and priceOk and gapOk and dollarVolOk and regimeOk and vwapAlign and not rangeVeto
+
+f_extOk(trigger) =>
+    not na(trigger) and not na(dailyATR) and dailyATR > 0 and (close - trigger) <= dailyATR * maxExtATR
+f_riskOk(stop) =>
+    not na(stop) and not na(dailyATR) and dailyATR > 0 and close > stop and
+       (close - stop) >= dailyATR * minRiskATR and (close - stop) <= dailyATR * maxRiskATR
+
+// ---------------- SETUPS (identical to scanner v2) ----------------
+orbStop = orbStopMode == "OR low" ? orLow : orbStopMode == "OR mid" ? (orHigh + orLow) / 2.0 : low
+orbTrig = useORB and baseOk and not tooManyFails and not (oneShot and firedORB) and
+       not na(orHigh) and close > orHigh and close[1] <= orHigh and upperHalf and volOk and
+       f_extOk(orHigh) and f_riskOk(orbStop)
+
+vwapStop = math.min(low, low[1])
+vwapTrig = useVWAP and baseOk and hadImpulse and not (oneShot and firedVWAP) and
+       not na(vwapVal) and close > vwapVal and close[1] <= vwapVal and upperHalf and volOk and
+       f_extOk(vwapVal) and f_riskOk(vwapStop)
+
+belowPMH = not na(pmHigh) and ta.highest(close, 3)[1] <= pmHigh
+pmhStop  = ta.lowest(low, 5)
+pmhTrig  = usePMH and baseOk and not (oneShot and firedPMH) and
+       not na(pmHigh) and close > pmHigh and close[1] <= pmHigh and upperHalf and volOk and belowPMH and
+       f_extOk(pmHigh) and f_riskOk(pmhStop)
+
+// ---------------- EXECUTION (mirrors validator sizing + caps) ----------------
+// Sized like the validator: risk dollars / (stop distance + slip buffer),
+// clamped to the per-trade notional cap. Fractional qty allowed (Robinhood).
+f_qty(entry, stop) =>
+    riskD    = equity * riskPct / 100.0
+    atrSlip  = na(dailyATR) ? entry * 0.001 : dailyATR * slipATRfrac
+    tickSlip = minSlipTicks * syminfo.mintick
+    slipBuf  = math.max(atrSlip, tickSlip)
+    perShare = (entry - stop) + slipBuf
+    sh       = perShare <= 0.0 ? 0.0 : riskD / perShare
+    sh * entry > maxNotional ? maxNotional / entry : sh
+
+canEnter = strategy.position_size == 0 and tradesToday < maxPerDay and not inEOD
+
+// Brackets are computed from the SIGNAL bar close — exactly the levels the
+// alert payload would carry. The fill itself happens at next bar open.
+if orbTrig and canEnter
+    tradesToday := tradesToday + 1
+    firedORB    := true
+    strategy.entry("ORB", strategy.long, qty=f_qty(close, orbStop))
+    strategy.exit("ORB-brkt", from_entry="ORB", stop=orbStop, limit=close + (close - orbStop) * targetRR)
+
+if vwapTrig and canEnter and not orbTrig
+    tradesToday := tradesToday + 1
+    firedVWAP   := true
+    strategy.entry("VWAP", strategy.long, qty=f_qty(close, vwapStop))
+    strategy.exit("VWAP-brkt", from_entry="VWAP", stop=vwapStop, limit=close + (close - vwapStop) * targetRR)
+
+if pmhTrig and canEnter and not orbTrig and not vwapTrig
+    tradesToday := tradesToday + 1
+    firedPMH    := true
+    strategy.entry("PMH", strategy.long, qty=f_qty(close, pmhStop))
+    strategy.exit("PMH-brkt", from_entry="PMH", stop=pmhStop, limit=close + (close - pmhStop) * targetRR)
+
+// Flat by end of day: cash account, no overnight holds.
+if inEOD
+    strategy.cancel_all()
+    strategy.close_all(comment="EOD flat")
+
+// ---------------- VISUALS ----------------
+plot(orDone ? orHigh : na, "OR High", color.new(color.aqua, 0),  1, plot.style_linebr)
+plot(orDone ? orLow  : na, "OR Low",  color.new(color.aqua, 50), 1, plot.style_linebr)
+plot(not na(pmHigh) ? pmHigh : na, "PM High", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(inRTH ? vwapVal : na, "VWAP (RTH)", color.new(color.fuchsia, 0), 2)
+bgcolor(rangeVeto ? color.new(color.red, 92) : na, title="Range veto")
+bgcolor(inRTH and not inSig ? color.new(color.gray, 94) : na, title="Outside signal window")
