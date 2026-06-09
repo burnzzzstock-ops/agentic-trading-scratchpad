@@ -25,6 +25,7 @@ export default {
       headers: {
         "Content-Type": "application/json",
         "Authorization": "Bearer " + env.ROUTINE_TOKEN,
+        "anthropic-version": "2023-06-01",
       },
       // JSON.stringify escapes the payload correctly no matter what
       // TradingView sends — the wrapping can't be malformed.
