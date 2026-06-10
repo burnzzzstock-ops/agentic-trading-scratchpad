@@ -42,9 +42,12 @@ volMult     = input.float(1.5, "Breakout vol must exceed avg x",    group=gV)
 requireVWAP = input.bool(true, "Breakouts must be above RTH VWAP",  group=gV)
 
 gS = "Setups"
-useORB   = input.bool(true, "Opening Range Breakout",            group=gS)
-useVWAP  = input.bool(true, "VWAP first-pullback reclaim",       group=gS)
-usePMH   = input.bool(true, "Reclaimed premarket-high breakout", group=gS)
+// Live default: VWAP reclaim ONLY. ORB fires into the worst spreads of the
+// session; PMH_BREAK is always manual-gated by the validator anyway. Re-enable
+// only after the journal shows VWAP-only expectancy over 30-50 reps.
+useORB   = input.bool(false, "Opening Range Breakout",            group=gS)
+useVWAP  = input.bool(true,  "VWAP first-pullback reclaim",       group=gS)
+usePMH   = input.bool(false, "Reclaimed premarket-high breakout", group=gS)
 oneShot  = input.bool(true, "One alert per setup per day",       group=gS)
 orbStopMode = input.string("OR mid", "ORB stop basis", options=["OR low", "OR mid", "Bar low"], group=gS)
 
