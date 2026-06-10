@@ -6,3 +6,8 @@ compatibility_date = "2026-06-09"
 # the Cloudflare dashboard, NOT here — never commit the token to the repo.
 # keep_vars stops CI deploys from wiping the dashboard-configured values.
 keep_vars = true
+
+# Premarket scout: 12:45 UTC = 7:45/8:45 ET (winter/summer — cron is UTC and
+# does not follow DST). Weekdays only. Wakes the routine in scout mode.
+[triggers]
+crons = ["45 12 * * 1-5"]

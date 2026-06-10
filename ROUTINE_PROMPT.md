@@ -17,6 +17,22 @@ TradingView scanner payload arrives as freeform text in this run's context.
 
 Run this exact pipeline. Do not improvise around the gates.
 
+## 0. Scout mode (cron-triggered, premarket — NEVER trades)
+If the payload is `{"mode":"scout"}` (no ticker/setup), this is the premarket
+catalyst scout, not a trade signal. Run this flow INSTEAD of the pipeline:
+1. `python3 scout.py --watchlist scanner/watchlist_100.txt` — sweeps fresh
+   SEC 8-K filings market-wide and returns graded off-watchlist candidates.
+2. For each candidate, `get_equity_quotes` (read-only) → compute gap % vs
+   prev_close. Keep names with price ≥ $2 and gap ≥ +2%; drop the rest.
+3. Treat news grades skeptically — the Google News query is by company name
+   and picks up other companies' headlines (known false-positive class).
+   Flag any candidate whose top headlines aren't clearly about THAT company.
+4. Journal the survivors to `journal/YYYY-MM-DD-scout.md` (ticker, catalyst
+   tier + description, gap %, dilution flag, verdict) and commit.
+5. Summarize: which names (if any) deserve a manually-added TradingView
+   chart + alert this morning. Scout mode places NO orders, reviews NO
+   orders, and never modifies the watchlist itself — a human does that.
+
 ## 1. Parse
 Extract the JSON payload from the run context (it may be a literal string).
 Pull: `ticker, setup, price, stop, target, shares, notional, gap_pct, vol_x`.
